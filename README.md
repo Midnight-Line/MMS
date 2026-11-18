@@ -4,8 +4,8 @@ This is an implementation of the Maritime Messaging Service - One of the three c
 the [Maritime Connectivity Platform (MCP)](https://maritimeconnectivity.net/mcp-documents/). It is under the Apache 2.0
 License.
 
-The following sections describe how to set up the router and edge router components of the MMS. Note that the setting up
-MMS over VDES is not covered by this guide.
+The following sections describe how to set up the router and edge router components of the MMS. The edge router can
+optionally carry MMS traffic over VDES, see [VDE transport](#vde-transport).
 
 For instructions on how to set up an MMS Agent, read [here](#setting-up-an-mms-agent)
 
@@ -90,6 +90,29 @@ restrictions on the allowed operations.
 * `health-port` The port number for the plaintext health check server, exposing a `/health` endpoint. Defaults to
   `8889`.
 * `skip-revocation-check` Allow client certificates that do not have OCSP or CRL endpoints for revocation checking.
+
+#### VDE transport
+
+The Edge Router can carry MMS traffic over VDES in addition to the IP/websocket link. The same binary serves both
+roles; only the attachment differs.
+
+* `vde-enabled` Enable the VDE transport. Defaults to `false`.
+* `vde-mode` Where this Edge Router sits: `shore` (or `core`) connects to the VDE core network over TCP and lets it
+  perform VDE framing, `ship` (or `modem`) drives the ship modem over the PI interface. Defaults to `shore`.
+* `vde-core-addr` `host:port` of the VDE core network service, used in `shore` mode. Defaults to `127.0.0.1:9000`.
+* `vde-modem-addr` `host:port` of the ship modem PI service, used in `ship` mode. Defaults to `127.0.0.1:60030`.
+* `vde-preferred` Transport preference for outgoing traffic: `ip`, `vde` or `auto`. Defaults to `auto`, which uses the
+  VDE link for small messages and the IP link for payloads above 8192 bytes, mirroring the VDE-TER payload limit.
+* `vde-mrn-mmsi` Optional static `MRN=MMSI[,MRN=MMSI...]` pairs used to preload the MRN↔MMSI mapping.
+* `vde-map-ttl` Time-to-live for MRN↔MMSI bindings learned from uplink traffic. Defaults to `15m`.
+
+Ship mode example:
+
+`./edgerouter -raddr "wss://127.0.0.1:8080" -port 7000 -mrn urn:mrn:mcp:device:mcc-test:ship-er -vde-enabled -vde-mode ship -vde-modem-addr 192.168.1.10:60030 -vde-preferred auto -vde-mrn-mmsi "urn:mrn:mcp:device:mcc-test:shore-er=992359599"`
+
+Shore mode example:
+
+`./edgerouter -raddr "wss://127.0.0.1:8080" -port 7000 -mrn urn:mrn:mcp:device:mcc-test:shore-er -vde-enabled -vde-mode shore -vde-core-addr 10.0.0.5:9000 -vde-preferred auto`
 
 #### Usage example
 

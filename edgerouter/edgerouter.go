@@ -46,6 +46,8 @@ import (
 	"github.com/maritimeconnectivity/MMS/utils/errMsg"
 	"github.com/maritimeconnectivity/MMS/utils/revocation"
 	"github.com/maritimeconnectivity/MMS/utils/rw"
+	"github.com/maritimeconnectivity/MMS/vde/link"
+	"github.com/maritimeconnectivity/MMS/vde/mapping"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -123,6 +125,7 @@ type EdgeRouter struct {
 	httpClient      *http.Client                 // The EdgeRouters http client if provided
 	wsMu            *sync.RWMutex                // Mutex for locking the WS upon send/recv, to properly handle if socket was closed
 	geoLocation     string                       //Lookup code for the actual position of the running instance
+	linkManager     *link.LinkManager            // selects between the IP and VDE transport for outgoing messages
 }
 
 func NewEdgeRouter(listeningAddr string, mrn *string, outgoingChannel chan *mmtp.MmtpMessage, routerWs *websocket.Conn, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, routerAddr *string, httpClient *http.Client, geoLoc string, skipRevocationCheck bool) (*EdgeRouter, error) {
@@ -1068,7 +1071,12 @@ func handleOutgoingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 				switch outgoingMessage.GetMsgType() {
 				case mmtp.MsgType_PROTOCOL_MESSAGE:
 					{
-						if err := rw.WriteMessage(ctx, edgeRouter.routerWs, outgoingMessage); err != nil {
+						if err := edgeRouter.sendOutgoing(ctx, outgoingMessage); err != nil {
+							if errors.Is(err, ErrNoRecipientMapping) {
+								// Permanent addressing failure: retrying cannot succeed.
+								log.Errorf("Dropping undeliverable message %s: %v", outgoingMessage.GetUuid(), err)
+								continue
+							}
 							log.Warn("Could not send outgoing message to MMS Router, will try again later:", err)
 							edgeRouter.outgoingChannel <- outgoingMessage
 							edgeRouter.wsMu.Lock()
@@ -1092,6 +1100,18 @@ func handleOutgoingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 
 		}
 	}
+}
+
+// sendOutgoing delivers one MMTP message. Control-plane traffic (CONNECT,
+// SUBSCRIBE, RECEIVE, NOTIFY, ...) is always exchanged with the MMS Router over
+// the IP link; only application messages may be routed over the VDE link.
+func (er *EdgeRouter) sendOutgoing(ctx context.Context, msg *mmtp.MmtpMessage) error {
+	if er.linkManager != nil {
+		if pm := msg.GetProtocolMessage(); pm != nil && pm.GetProtocolMsgType() == mmtp.ProtocolMessageType_SEND_MESSAGE {
+			return er.linkManager.Send(msg)
+		}
+	}
+	return rw.WriteMessage(ctx, er.routerWs, msg)
 }
 
 func recordMetrics(ctx context.Context, wg *sync.WaitGroup, reg *prometheus.Registry, er *EdgeRouter) {
@@ -1277,6 +1297,13 @@ func runWithStderr(args []string, stderr io.Writer) error {
 	prometheusPort := flagSet.Int("prometheus-port", 2112, "The port number for the Prometheus metrics server.")
 	healthPort := flagSet.Int("health-port", 8889, "The port number for the plaintext health check server.")
 	skipRevocationCheck := flagSet.Bool("skip-revocation-check", false, "Allow client certificates that do not have OCSP or CRL endpoints for revocation checking.")
+	vdeEnabled := flagSet.Bool("vde-enabled", false, "Enable the VDE transport in addition to IP.")
+	vdeMode := flagSet.String("vde-mode", "shore", "VDE attachment: shore (core network TCP), ship (ship modem PI) or core (same as shore).")
+	vdeCoreAddr := flagSet.String("vde-core-addr", "127.0.0.1:9000", "host:port of the VDE core network TCP service, used in shore mode.")
+	vdeModemAddr := flagSet.String("vde-modem-addr", "127.0.0.1:60030", "host:port of the ship modem PI service, used in ship mode.")
+	vdePreferred := flagSet.String("vde-preferred", "auto", "Transport preference: ip, vde or auto.")
+	vdeMrnMmsi := flagSet.String("vde-mrn-mmsi", "", "Optional static MRN=MMSI[,MRN=MMSI...] pairs to preload the MRN<->MMSI mapping.")
+	vdeMapTTL := flagSet.Duration("vde-map-ttl", 15*time.Minute, "Time-to-live for MRN<->MMSI bindings learned from uplink traffic.")
 
 	if err := flagSet.Parse(args); err != nil {
 		return err
@@ -1350,6 +1377,49 @@ func runWithStderr(args []string, stderr io.Writer) error {
 
 	wg.Add(1)
 	go er.StartEdgeRouter(ctx, wg, certPath, certKeyPath)
+
+	if *vdeEnabled {
+		mp := mapping.New(*vdeMapTTL)
+		for _, pair := range strings.Split(*vdeMrnMmsi, ",") {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			mrn, mmsiStr, ok := strings.Cut(pair, "=")
+			if !ok {
+				log.Warnf("Ignoring malformed MRN=MMSI pair %q", pair)
+				continue
+			}
+			mmsi, convErr := strconv.ParseInt(strings.TrimSpace(mmsiStr), 10, 64)
+			if convErr != nil {
+				log.Warnf("Ignoring MRN=MMSI pair %q with invalid MMSI: %v", pair, convErr)
+				continue
+			}
+			mp.Upsert(strings.TrimSpace(mrn), mmsi, true)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mp.RunEviction(ctx.Done(), time.Minute)
+		}()
+
+		vdeL, stopVde, modeErr := buildVdeLink(*vdeMode, *vdeCoreAddr, *vdeModemAddr, mp, er)
+		if modeErr != nil {
+			return modeErr
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ctx.Done()
+			stopVde()
+		}()
+
+		manager := link.NewManager(link.Config{Preferred: link.ParsePreferred(*vdePreferred)})
+		manager.Register(&ipLink{er: er})
+		manager.Register(vdeL)
+		er.linkManager = manager
+		log.Infof("VDE transport enabled in %s mode (preference %s)", *vdeMode, *vdePreferred)
+	}
 
 	//Start monitoring
 	wg.Add(2)

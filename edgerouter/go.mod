@@ -10,6 +10,7 @@ require (
 	github.com/maritimeconnectivity/MMS/consumer v0.0.0
 	github.com/maritimeconnectivity/MMS/mmtp v0.0.0
 	github.com/maritimeconnectivity/MMS/utils v0.0.0
+	github.com/maritimeconnectivity/MMS/vde v0.0.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/stretchr/testify v1.11.1
 )
@@ -58,5 +59,7 @@ replace github.com/maritimeconnectivity/MMS/mmtp => ../mmtp
 replace github.com/maritimeconnectivity/MMS/utils => ../utils
 
 replace github.com/maritimeconnectivity/MMS/consumer => ../consumer
+
+replace github.com/maritimeconnectivity/MMS/vde => ../vde
 
 tool honnef.co/go/tools/cmd/staticcheck

@@ -1,7 +1,7 @@
 BINARIES := edgerouter router genkey
 .PHONY: all $(BINARIES) clean test update-tools vet
 
-MODULES := $(BINARIES) consumer mmtp utils
+MODULES := $(BINARIES) consumer mmtp utils vde
 TIDY_MODULES := $(addsuffix .tidy,$(MODULES))
 VET_MODULES := $(addsuffix .vet,$(MODULES))
 TEST_MODULES := $(addsuffix .test,$(MODULES))
