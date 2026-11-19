@@ -126,6 +126,10 @@ type EdgeRouter struct {
 	wsMu            *sync.RWMutex                // Mutex for locking the WS upon send/recv, to properly handle if socket was closed
 	geoLocation     string                       //Lookup code for the actual position of the running instance
 	linkManager     *link.LinkManager            // selects between the IP and VDE transport for outgoing messages
+	vdeRelay        bool                         // relay application messages between the MMS Router and the VDE link
+	vdeLink         link.Link                    // the VDE transport, used for relaying when vdeRelay is set
+	seen            map[string]time.Time         // fingerprints of recently handled application messages, used for de-duplication
+	seenMu          sync.Mutex                   // a Mutex for locking the seen map, a value so that the zero EdgeRouter is usable
 }
 
 func NewEdgeRouter(listeningAddr string, mrn *string, outgoingChannel chan *mmtp.MmtpMessage, routerWs *websocket.Conn, ctx context.Context, wg *sync.WaitGroup, clientCAs *string, routerAddr *string, httpClient *http.Client, geoLoc string, skipRevocationCheck bool) (*EdgeRouter, error) {
@@ -986,52 +990,12 @@ func handleIncomingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 							continue
 						}
 
-						incomingMessage := &mmtp.MmtpMessage{
-							MsgType: mmtp.MsgType_PROTOCOL_MESSAGE,
-							Uuid:    uuid.NewString(),
-							Body: &mmtp.MmtpMessage_ProtocolMessage{
-								ProtocolMessage: &mmtp.ProtocolMessage{
-									ProtocolMsgType: mmtp.ProtocolMessageType_SEND_MESSAGE,
-									Body: &mmtp.ProtocolMessage_SendMessage{
-										SendMessage: &mmtp.Send{
-											ApplicationMessage: appMsg,
-										},
-									},
-								},
-							},
-						}
-						switch subjectOrRecipient := appMsg.GetHeader().GetSubjectOrRecipient().(type) {
-						case *mmtp.ApplicationMessageHeader_Subject:
-							{
-								edgeRouter.subMu.RLock()
-								subscription := edgeRouter.subscriptions[subjectOrRecipient.Subject]
-								var subscribers []*Agent
-								if subscription != nil {
-									subscribers = subscription.SnapshotSubscribers()
-								}
-								edgeRouter.subMu.RUnlock()
-								for _, subscriber := range subscribers {
-									if err = subscriber.QueueMessage(incomingMessage); err != nil {
-										log.Error("Could not queue message:", err)
-									}
-								}
-							}
-						case *mmtp.ApplicationMessageHeader_Recipients:
-							{
-								edgeRouter.mrnToAgentMu.RLock()
-								for _, recipient := range subjectOrRecipient.Recipients.GetRecipients() {
-									log.Debugf("recipient %s, hex: %x", recipient, recipient)
-									agent, ok := edgeRouter.mrnToAgent[recipient]
-									log.Debugf("agent: %v, ok: %t", agent, ok)
-									if ok && agent.directMessages {
-										err = agent.QueueMessage(incomingMessage)
-										if err != nil {
-											log.Error("Could not queue message for Agent:", err)
-										}
-									}
-								}
-								edgeRouter.mrnToAgentMu.RUnlock()
-							}
+						// Deliver locally through the shared distribution path. When this
+						// Edge Router acts as a VDE-TER gateway and nothing was delivered
+						// locally, the message is relayed onwards over the VDE link.
+						queued, handled := edgeRouter.queueApplicationMessage(appMsg)
+						if queued == 0 && !handled {
+							edgeRouter.relayToVDE(appMsg)
 						}
 					}
 				}
@@ -1055,6 +1019,116 @@ func handleIncomingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *syn
 			}
 		}
 	}
+}
+
+// relayToVDE forwards an application message that arrived from the MMS Router
+// over the VDE link. This is what turns an Edge Router into a VDE-TER gateway:
+// messages that no locally connected agent consumed are handed to the VDE
+// transport instead of being dropped.
+func (er *EdgeRouter) relayToVDE(appMsg *mmtp.ApplicationMessage) {
+	if !er.vdeRelay || er.vdeLink == nil || appMsg == nil {
+		return
+	}
+
+	msg := &mmtp.MmtpMessage{
+		MsgType: mmtp.MsgType_PROTOCOL_MESSAGE,
+		Uuid:    uuid.NewString(),
+		Body: &mmtp.MmtpMessage_ProtocolMessage{
+			ProtocolMessage: &mmtp.ProtocolMessage{
+				ProtocolMsgType: mmtp.ProtocolMessageType_SEND_MESSAGE,
+				Body: &mmtp.ProtocolMessage_SendMessage{
+					SendMessage: &mmtp.Send{ApplicationMessage: appMsg},
+				},
+			},
+		},
+	}
+
+	if err := er.vdeLink.Send(msg); err != nil {
+		if errors.Is(err, ErrNoRecipientMapping) {
+			log.Debugf("Not relaying message %s over VDE: %v", msg.GetUuid(), err)
+			return
+		}
+		log.Errorf("Could not relay message %s over VDE: %v", msg.GetUuid(), err)
+		return
+	}
+	log.Infof("Relayed message from %s over VDE", appMsg.GetHeader().GetSender())
+}
+
+// relayToRouter is the opposite direction of relayToVDE: a message that arrived
+// over the VDE link and that no local agent consumed is published into the MMS
+// Router network. It deliberately bypasses the link manager, because the link
+// manager would route the message straight back over VDE.
+func (er *EdgeRouter) relayToRouter(appMsg *mmtp.ApplicationMessage) {
+	if !er.vdeRelay || appMsg == nil {
+		return
+	}
+	if !er.wsMu.TryRLock() {
+		log.Debug("Not relaying message to the MMS Router: websocket is reconnecting")
+		return
+	}
+	conn := er.routerWs
+	er.wsMu.RUnlock()
+	if conn == nil {
+		log.Debug("Not relaying message to the MMS Router: no websocket connection")
+		return
+	}
+
+	msg := &mmtp.MmtpMessage{
+		MsgType: mmtp.MsgType_PROTOCOL_MESSAGE,
+		Uuid:    uuid.NewString(),
+		Body: &mmtp.MmtpMessage_ProtocolMessage{
+			ProtocolMessage: &mmtp.ProtocolMessage{
+				ProtocolMsgType: mmtp.ProtocolMessageType_SEND_MESSAGE,
+				Body: &mmtp.ProtocolMessage_SendMessage{
+					SendMessage: &mmtp.Send{ApplicationMessage: appMsg},
+				},
+			},
+		},
+	}
+
+	if err := rw.WriteMessage(context.Background(), conn, msg); err != nil {
+		log.Errorf("Could not relay message %s to the MMS Router: %v", msg.GetUuid(), err)
+		return
+	}
+	log.Infof("Relayed message from %s to the MMS Router", appMsg.GetHeader().GetSender())
+}
+
+// subscribeOnRouter asks the MMS Router to deliver everything addressed to the
+// given subject (usually an agent MRN) to this Edge Router, so that it can be
+// relayed over the VDE link.
+//
+// The subscription is recorded locally without any subscriber attached: the
+// messages arrive from the Router and are relayed over VDE, so there is no
+// agent on this side to hand them to.
+func (er *EdgeRouter) subscribeOnRouter(ctx context.Context, subject string) {
+	er.subMu.Lock()
+	if _, exists := er.subscriptions[subject]; !exists {
+		er.subscriptions[subject] = NewSubscription(subject)
+	}
+	er.subMu.Unlock()
+
+	msg := &mmtp.MmtpMessage{
+		MsgType: mmtp.MsgType_PROTOCOL_MESSAGE,
+		Uuid:    uuid.NewString(),
+		Body: &mmtp.MmtpMessage_ProtocolMessage{
+			ProtocolMessage: &mmtp.ProtocolMessage{
+				ProtocolMsgType: mmtp.ProtocolMessageType_SUBSCRIBE_MESSAGE,
+				Body: &mmtp.ProtocolMessage_SubscribeMessage{
+					SubscribeMessage: &mmtp.Subscribe{
+						SubjectOrDirectMessages: &mmtp.Subscribe_Subject{Subject: subject},
+					},
+				},
+			},
+		},
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case er.outgoingChannel <- msg:
+			log.Infof("Subscribed to %s on the MMS Router for VDE relaying", subject)
+		}
+	}()
 }
 
 func handleOutgoingMessages(ctx context.Context, edgeRouter *EdgeRouter, wg *sync.WaitGroup) {
@@ -1304,6 +1378,8 @@ func runWithStderr(args []string, stderr io.Writer) error {
 	vdePreferred := flagSet.String("vde-preferred", "auto", "Transport preference: ip, vde or auto.")
 	vdeMrnMmsi := flagSet.String("vde-mrn-mmsi", "", "Optional static MRN=MMSI[,MRN=MMSI...] pairs to preload the MRN<->MMSI mapping.")
 	vdeMapTTL := flagSet.Duration("vde-map-ttl", 15*time.Minute, "Time-to-live for MRN<->MMSI bindings learned from uplink traffic.")
+	vdeRelay := flagSet.Bool("vde-relay", false, "Act as a VDE-TER gateway: relay application messages between the MMS Router and the VDE link.")
+	vdeRelaySubjects := flagSet.String("vde-relay-subjects", "", "Comma separated MRNs or subjects to subscribe to on the MMS Router so that messages for them can be relayed over VDE.")
 
 	if err := flagSet.Parse(args); err != nil {
 		return err
@@ -1418,6 +1494,17 @@ func runWithStderr(args []string, stderr io.Writer) error {
 		manager.Register(&ipLink{er: er})
 		manager.Register(vdeL)
 		er.linkManager = manager
+		er.vdeRelay = *vdeRelay
+		er.vdeLink = vdeL
+		if *vdeRelay && *vdeRelaySubjects != "" {
+			for _, subject := range strings.Split(*vdeRelaySubjects, ",") {
+				subject = strings.TrimSpace(subject)
+				if subject == "" {
+					continue
+				}
+				er.subscribeOnRouter(ctx, subject)
+			}
+		}
 		log.Infof("VDE transport enabled in %s mode (preference %s)", *vdeMode, *vdePreferred)
 	}
 

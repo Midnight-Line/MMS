@@ -162,5 +162,8 @@ func (l *modemLink) handleMessage(mmsi int64, payload []byte) {
 		l.mapTable.ObserveUplink(sender, mmsi)
 	}
 
-	l.er.queueApplicationMessage(appMsg)
+	queued, handled := l.er.queueApplicationMessage(appMsg)
+	if queued == 0 && !handled {
+		l.er.relayToRouter(appMsg)
+	}
 }

@@ -334,3 +334,81 @@ func TestModemIgnoresGarbage(t *testing.T) {
 		return count == 1
 	})
 }
+
+// A payload that fits in a single TDB sentence is transmitted as one Start
+// fragment with no End fragment. The modem must deliver it anyway instead of
+// waiting for a terminator that never arrives.
+func TestModemDeliversSingleSentenceTDB(t *testing.T) {
+	fake := newFakeModem(t)
+
+	var mu sync.Mutex
+	var got [][]byte
+	m := NewModem(fake.addr(), ModemHandler{
+		OnMessage: func(_ int64, payload []byte) {
+			mu.Lock()
+			got = append(got, payload)
+			mu.Unlock()
+		},
+	})
+	m.Start()
+	t.Cleanup(m.Stop)
+	waitFor(t, "modem link up", m.Healthy)
+
+	fake.push(t, Format(SentenceStart, TalkerVDES, "TDB", []string{
+		"1", // total sentences: a single sentence
+		"1", // sentence number
+		"7", // message sequence number
+		"",  // source
+		"992359599",
+		"0",
+		formatOptionalID(int64(MsgStart)),
+		Encode6Bit([]byte("single sentence payload")),
+		"0",
+	}))
+
+	waitFor(t, "single sentence message", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) == 1
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if string(got[0]) != "single sentence payload" {
+		t.Errorf("payload = %q, want single sentence payload", got[0])
+	}
+}
+
+// The same single sentence message arriving twice must be delivered twice:
+// de-duplication belongs to the Edge Router, not to the modem.
+func TestModemSingleSentenceTDBRepeats(t *testing.T) {
+	fake := newFakeModem(t)
+
+	var mu sync.Mutex
+	var got [][]byte
+	m := NewModem(fake.addr(), ModemHandler{
+		OnMessage: func(_ int64, payload []byte) {
+			mu.Lock()
+			got = append(got, payload)
+			mu.Unlock()
+		},
+	})
+	m.Start()
+	t.Cleanup(m.Stop)
+	waitFor(t, "modem link up", m.Healthy)
+
+	sentence := Format(SentenceStart, TalkerVDES, "TDB", []string{
+		"1", "1", "7", "", "992359599", "0",
+		formatOptionalID(int64(MsgStart)),
+		Encode6Bit([]byte("again")),
+		"0",
+	})
+	fake.push(t, sentence)
+	fake.push(t, sentence)
+
+	waitFor(t, "two deliveries", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) == 2
+	})
+}

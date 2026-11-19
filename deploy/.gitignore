@@ -1,0 +1,10 @@
+# Build output
+bin/
+
+# Runtime state: logs, pid files, message dumps
+run/
+
+# Certificates and the sub-CA bundle. Issue them locally with prepare-certs.cmd;
+# they must never be committed.
+certs/
+secrets/

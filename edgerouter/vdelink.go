@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -16,6 +18,11 @@ import (
 	"github.com/maritimeconnectivity/MMS/vde/mapping"
 	"google.golang.org/protobuf/proto"
 )
+
+// duplicateWindow is how long the fingerprint of an application message is
+// remembered, so that the same message arriving over both the IP and the VDE
+// transport is only delivered once.
+const duplicateWindow = 5 * time.Minute
 
 // ErrNoRecipientMapping signals a permanent delivery failure: none of the
 // addressed recipients has a known MMSI, so retrying cannot help.
@@ -171,7 +178,12 @@ func (l *vdeLink) handleUplink(uplink corenet.Uplink) {
 		l.mapTable.ObserveUplink(sender, uplink.MMSI)
 	}
 
-	l.er.queueApplicationMessage(appMsg)
+	// Nothing subscribed locally means the message has to continue into the
+	// MMS Router network when this Edge Router acts as a VDE-TER gateway.
+	queued, handled := l.er.queueApplicationMessage(appMsg)
+	if queued == 0 && !handled {
+		l.er.relayToRouter(appMsg)
+	}
 }
 
 func (l *vdeLink) handleAck(ack corenet.Ack) {
@@ -189,12 +201,25 @@ func (l *vdeLink) handleCoverage(coverage corenet.Coverage) {
 
 // queueApplicationMessage distributes an application message to locally
 // connected agents, honouring subject subscriptions and direct recipients.
-func (er *EdgeRouter) queueApplicationMessage(appMsg *mmtp.ApplicationMessage) {
+//
+// It returns how many local agents the message was queued for, which lets a
+// gateway Edge Router decide whether the message still has to be relayed to
+// another transport, together with a flag telling whether the message had
+// already been handled. The same application message can reach an Edge Router
+// twice when it is subscribed to a subject on the MMS Router while the VDE-TER
+// gateway relays the same subject over the air interface, so duplicates are
+// recognised on their content and dropped.
+func (er *EdgeRouter) queueApplicationMessage(appMsg *mmtp.ApplicationMessage) (int, bool) {
 	now := time.Now()
 	msgExpires := appMsg.GetHeader().GetExpires()
 	if now.Unix() > msgExpires || msgExpires > now.Add(ExpirationLimit).Unix() {
 		log.Debug("Discarding expired application message")
-		return
+		return 0, true
+	}
+
+	if er.seenMessage(appMsg, now) {
+		log.Debugf("Discarding duplicate application message from %s", appMsg.GetHeader().GetSender())
+		return 0, true
 	}
 
 	incomingMessage := &mmtp.MmtpMessage{
@@ -210,6 +235,7 @@ func (er *EdgeRouter) queueApplicationMessage(appMsg *mmtp.ApplicationMessage) {
 		},
 	}
 
+	queued := 0
 	switch subjectOrRecipient := appMsg.GetHeader().GetSubjectOrRecipient().(type) {
 	case *mmtp.ApplicationMessageHeader_Subject:
 		er.subMu.RLock()
@@ -222,7 +248,9 @@ func (er *EdgeRouter) queueApplicationMessage(appMsg *mmtp.ApplicationMessage) {
 		for _, subscriber := range subscribers {
 			if err := subscriber.QueueMessage(incomingMessage); err != nil {
 				log.Error("Could not queue message:", err)
+				continue
 			}
+			queued++
 		}
 	case *mmtp.ApplicationMessageHeader_Recipients:
 		er.mrnToAgentMu.RLock()
@@ -231,9 +259,47 @@ func (er *EdgeRouter) queueApplicationMessage(appMsg *mmtp.ApplicationMessage) {
 			if ok && agent.directMessages {
 				if err := agent.QueueMessage(incomingMessage); err != nil {
 					log.Error("Could not queue message for Agent:", err)
+					continue
 				}
+				queued++
 			}
 		}
 		er.mrnToAgentMu.RUnlock()
 	}
+	return queued, false
+}
+
+// seenMessage records the content of an application message and reports
+// whether it had been seen before. Messages are identified by the same fields
+// that are covered by the message signature, so the same payload arriving over
+// IP and over VDE maps to the same fingerprint even though every hop gives the
+// carrying MMTP message a fresh UUID.
+func (er *EdgeRouter) seenMessage(appMsg *mmtp.ApplicationMessage, now time.Time) bool {
+	header := appMsg.GetHeader()
+	digest := sha256.New()
+	digest.Write([]byte(header.GetSubject()))
+	for _, recipient := range header.GetRecipients().GetRecipients() {
+		digest.Write([]byte(recipient))
+	}
+	digest.Write([]byte(strconv.FormatInt(header.GetExpires(), 10)))
+	digest.Write([]byte(header.GetSender()))
+	digest.Write([]byte(strconv.Itoa(int(header.GetBodySizeNumBytes()))))
+	digest.Write(appMsg.GetBody())
+	key := string(digest.Sum(nil))
+
+	er.seenMu.Lock()
+	defer er.seenMu.Unlock()
+	if er.seen == nil {
+		er.seen = map[string]time.Time{}
+	}
+	if seenAt, ok := er.seen[key]; ok && now.Sub(seenAt) < duplicateWindow {
+		return true
+	}
+	er.seen[key] = now
+	for seenKey, seenAt := range er.seen {
+		if now.Sub(seenAt) >= duplicateWindow {
+			delete(er.seen, seenKey)
+		}
+	}
+	return false
 }

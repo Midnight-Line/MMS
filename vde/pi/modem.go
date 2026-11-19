@@ -342,9 +342,19 @@ func (m *Modem) handleTDB(sentence Sentence) {
 	msgNumber := byte(tdb.DataType)
 	switch msgNumber {
 	case MsgStart, MsgContinue, MsgEnd:
-		// Chained fragment: feed the assembler.
+		// Chained fragment: feed the assembler below.
 	default:
 		// No chain information: the modem delivered a self-contained message.
+		if m.handler.OnMessage != nil {
+			m.handler.OnMessage(tdb.SourceID, payload)
+		}
+		return
+	}
+
+	// A message that fits in a single sentence is transmitted as one Start
+	// fragment with no End fragment following, so the assembler would wait
+	// forever for a terminator that never arrives.
+	if tdb.TotalSentences <= 1 {
 		if m.handler.OnMessage != nil {
 			m.handler.OnMessage(tdb.SourceID, payload)
 		}
